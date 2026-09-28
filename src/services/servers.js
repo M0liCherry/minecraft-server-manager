@@ -676,6 +676,18 @@ function updateServer(id, changes, { actor = 'system' } = {}) {
     params.push(changes[key]);
     if (RECREATE_FIELDS.has(key)) needsRecreate = true;
   }
+  if (changes.type !== undefined && changes.type !== before.type) {
+    // The TYPE allowlist lives in the field catalog (same source the wizard
+    // validates against), so this stays in sync with creation. The field
+    // catalog is already required at the top of this module (propEnvMap).
+    const typeField = require('../config/field-catalog').getField('env', 'TYPE');
+    const allowed = new Set((typeField && typeField.options ? typeField.options : []).map((o) => o.value));
+    if (!allowed.has(changes.type)) throw httpError(400, 'Unknown server type.');
+    diff.type = [before.type, changes.type];
+    sets.push('type = ?');
+    params.push(changes.type);
+    needsRecreate = true;
+  }
   if (changes.tags) {
     diff.tags = [before.tags, changes.tags];
     sets.push('tags_json = ?');

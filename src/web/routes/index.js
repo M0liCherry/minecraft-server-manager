@@ -509,6 +509,17 @@ router.get(
       }
       addrs.push(`localhost:${row.port_game}`);
       context.addresses = [...new Set(addrs)];
+      // Standalone software options for the overview's Change button. Pack
+      // types are excluded: a modpack owns its server's TYPE, so those servers
+      // get a "managed by modpack" note instead of the buttons. Type-based
+      // (not pack-row-based) so a pack-typed server without a recorded pack
+      // row is still guarded.
+      const typeField = require('../../config/field-catalog').getField('env', 'TYPE');
+      const modsSvc = require('../../services/mods');
+      context.packManaged = modsSvc.isPackServer(row);
+      context.softTypes = (typeField && typeField.options ? typeField.options : [])
+        .filter((o) => !modsSvc.isPackServer({ type: o.value }))
+        .map((o) => ({ value: o.value, label: o.label, desc: o.desc || '' }));
     } else if (tab === 'chat') {
       const live = require('../../services/liveCache').get(row.id);
       context.onlinePlayers = (live && live.players && live.players.names) || [];

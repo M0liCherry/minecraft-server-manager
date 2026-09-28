@@ -227,7 +227,7 @@ function createApp() {
   //    9.5 MB) are content-stable - their bytes never change without a new
   //    filename - so cache them hard and skip the conditional-GET storm those
   //    directories otherwise trigger on every page load.
-  //  - app-owned css/js still only gets a 1-hour max-age (not `immutable`), so a
+  //  - app-owned css still only gets a 1-hour max-age (not `immutable`), so a
   //    deploy is picked up within the hour even before the hashed-bundle step.
   const ONE_YEAR = 31536000;
 
@@ -247,7 +247,10 @@ function createApp() {
       fs.access(built, fs.constants.R_OK, (err) => {
         if (err) return next();
         res.type('application/javascript');
-        res.setHeader('Cache-Control', 'public, max-age=3600');
+        // Revalidate, not max-age: entry filenames are stable across builds
+        // while their chunk imports are content-hashed - an hour-old entry
+        // against new chunks is a silently dead page. 304s keep this cheap.
+        res.setHeader('Cache-Control', 'public, no-cache, must-revalidate');
         res.sendFile(built);
       });
     });

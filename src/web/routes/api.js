@@ -1187,6 +1187,23 @@ router.post(
     const server = requireServer(req.params.id);
     const actor = req.user.username;
 
+    // A downgrade (older DataVersion) does not convert the world down: the
+    // older jar cannot read the newer chunks and regenerates them as empty
+    // void, destroying builds. Refuse it outright unless explicitly forced,
+    // mirroring the mod-compatibility gate below. Answered here rather than
+    // thrown, for the same reason: the client needs the direction to explain.
+    // Runs before the mod gate - a downgrade is refused whatever the mods say.
+    if (targetVersion && targetVersion !== server.mc_version && !force) {
+      const { isDowngrade } = require('../../utils/mcVersion');
+      if (isDowngrade(server.mc_version, targetVersion)) {
+        return res.status(409).json({
+          ok: false,
+          error: `Minecraft ${targetVersion} is older than the running ${server.mc_version}. Downgrading destroys world data: the older server cannot read the newer chunks and regenerates them as empty void.`,
+          downgrade: { from: server.mc_version, to: targetVersion },
+        });
+      }
+    }
+
     // A Minecraft version change on a modded server has to be earned: every
     // installed mod needs a build for the target, established by a version
     // check (#52). `force` is the deliberate override - it is only ever sent
@@ -1233,6 +1250,85 @@ router.post(
         t.step('Recreating container…');
         await servers.recreateServer(server.id, { actor });
         return { ok: true, from: server.mc_version, to: targetVersion || server.mc_version, backupId };
+      }
+    );
+    res.status(202).json({ ok: true, taskId });
+  })
+);
+
+// Standalone software (server TYPE) change: Vanilla ↔ Paper ↔ Fabric ↔ …,
+// with a pre-change backup and a container rebuild, all inside one task.
+// Pack-managed servers are refused: their TYPE is owned by the installed pack
+// (change or remove the pack on the Versions tab instead). Switching TO a pack
+// type is refused for the same reason - packs are installed through their own
+// flows, which set the TYPE themselves.
+// Loader build pins for the previous software (FABRIC_LOADER_VERSION, …) are
+// dropped so they don't linger on a server that no longer runs that loader;
+// pins for the new software are kept as-is.
+const LOADER_PIN_ENV = {
+  FABRIC: ['FABRIC_LOADER_VERSION', 'FABRIC_LAUNCHER_VERSION'],
+  QUILT: ['QUILT_LOADER_VERSION'],
+  FORGE: ['FORGE_VERSION'],
+  NEOFORGE: ['NEOFORGE_VERSION'],
+  PAPER: ['PAPER_BUILD', 'PAPER_CHANNEL'],
+  PURPUR: ['PURPUR_BUILD'],
+};
+
+router.post(
+  '/servers/:id/type/change',
+  requireCap('settings'),
+  asyncHandler(async (req, res, next) => {
+    const { targetType } = z
+      .object({
+        targetType: z
+          .string()
+          .trim()
+          .min(1)
+          .max(32)
+          .refine((v) => SERVER_TYPES.includes(v), { message: 'Unknown server type.' }),
+      })
+      .parse(req.body);
+    const server = requireServer(req.params.id);
+    const modsService = require('../../services/mods');
+    if (modsService.isPackServer(server)) {
+      throw httpError(
+        400,
+        'This server runs a modpack, which owns its software. Change or remove the pack on the Versions tab instead.'
+      );
+    }
+    if (modsService.isPackServer({ type: targetType })) {
+      throw httpError(
+        400,
+        'Modpack software is installed through the modpack flows, which set the type themselves. Pick a standalone software instead.'
+      );
+    }
+    if (targetType === server.type) {
+      throw httpError(400, `This server already runs on ${targetType}.`);
+    }
+    const actor = req.user.username;
+    const taskId = tasks.run(
+      `Changing ${server.display_name} to ${targetType}…`,
+      { serverId: server.id, actor },
+      async (t) => {
+        t.step('Creating pre-change backup…');
+        const backup = await backups.createBackup(server.id, {
+          reason: 'pre-update',
+          actor,
+          note: `Before software ${server.type} → ${targetType}`,
+          task: t,
+        });
+        t.step('Applying new software…');
+        const keepPins = new Set(LOADER_PIN_ENV[targetType] || []);
+        const env = { ...server.env };
+        for (const pins of Object.values(LOADER_PIN_ENV)) {
+          for (const key of pins) {
+            if (!keepPins.has(key)) delete env[key];
+          }
+        }
+        servers.updateServer(server.id, { type: targetType, env }, { actor });
+        t.step('Recreating container…');
+        await servers.recreateServer(server.id, { actor });
+        return { ok: true, from: server.type, to: targetType, backupId: backup.id };
       }
     );
     res.status(202).json({ ok: true, taskId });

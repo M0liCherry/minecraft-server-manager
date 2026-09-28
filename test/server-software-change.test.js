@@ -152,6 +152,7 @@ test('the overview renders the software card', async () => {
   assert.match(r.text, /Software &amp; Version/);
   assert.match(r.text, /data-ov-change-type/);
   assert.match(r.text, /data-ov-change-version/);
+  assert.match(r.text, new RegExp(`data-chrome-status="${id}"`));
 });
 
 test('a modpack overview hides the change buttons', async () => {

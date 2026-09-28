@@ -333,9 +333,9 @@ async function createServerImpl(input, { actor = 'system', start = false, onProg
     `INSERT INTO servers (id, display_name, description, icon, accent, tags_json, type, mc_version,
        java_tag, env_json, port_game, port_rcon, port_query, port_bedrock, rcon_password_cipher,
        heap_mb, container_memory_mb, container_swap_mb, cpus, disk_quota_bytes, quota_strict,
-       update_policy, auto_start, auto_restart, status, container_name, network_name,
+       update_policy, mod_update_policy, auto_start, auto_restart, status, container_name, network_name,
        extra_ports_json, extra_binds_json)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'stopped', ?, ?, ?, ?)`,
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'stopped', ?, ?, ?, ?)`,
     id,
     input.name,
     input.description || '',
@@ -358,6 +358,7 @@ async function createServerImpl(input, { actor = 'system', start = false, onProg
     (input.diskQuotaGb ?? defaults.diskQuotaGb) * 1024 ** 3,
     input.quotaStrict ? 1 : 0,
     input.updatePolicy || 'manual',
+    input.modUpdatePolicy || 'manual',
     input.autoStart ? 1 : 0,
     input.autoRestart === false ? 0 : 1,
     input.containerName || null,
@@ -654,12 +655,13 @@ function updateServer(id, changes, { actor = 'system' } = {}) {
     icon: 'icon',
     accent: 'accent',
     notes: 'notes',
+    updatePolicy: 'update_policy',
+    modUpdatePolicy: 'mod_update_policy',
     mcVersion: 'mc_version',
     javaTag: 'java_tag',
     heapMb: 'heap_mb',
     containerMemoryMb: 'container_memory_mb',
     cpus: 'cpus',
-    updatePolicy: 'update_policy',
   };
   const diff = {};
   const sets = [];

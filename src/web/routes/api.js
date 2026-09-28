@@ -99,6 +99,7 @@ const createSchema = z
     cpus: optNum0(128),
     diskQuotaGb: optNum0(16384),
     updatePolicy: z.enum(['manual', 'notify', 'auto']).optional(),
+    modUpdatePolicy: z.enum(['manual', 'notify', 'auto']).optional(),
     autoStart: z.coerce.boolean().optional(),
     start: z.coerce.boolean().optional(),
     ...dockerOverridesSchema,
@@ -157,6 +158,7 @@ router.patch(
         diskQuotaGb: optNum0(16384),
         quotaStrict: z.coerce.boolean().optional(),
         updatePolicy: z.enum(['manual', 'notify', 'auto']).optional(),
+        modUpdatePolicy: z.enum(['manual', 'notify', 'auto']).optional(),
         autoStart: z.coerce.boolean().optional(),
         autoRestart: z.coerce.boolean().optional(),
         env: z.record(z.string(), z.string()).optional(),
@@ -865,6 +867,48 @@ router.get(
       }));
     } else {
       results = (await curseforgeApi.search({ query: q, kind: 'modpack' })).map((m) => ({
+        platform,
+        ref: m.slug,
+        name: m.name,
+        iconUrl: m.iconUrl,
+        downloads: m.downloads,
+        description: m.summary,
+      }));
+    }
+    res.json({ ok: true, results });
+  })
+);
+
+// Discover feed for the modpacks empty state: trending packs on the platform.
+// Packs span Minecraft versions, so there is no loader/MC narrowing here.
+router.get(
+  '/packs/discover',
+  asyncHandler(async (req, res, next) => {
+    const { platform, limit, offset } = z
+      .object({
+        platform: z.enum(['modrinth', 'curseforge']).default('modrinth'),
+        limit: z.coerce.number().int().min(1).max(12).default(6),
+        offset: z.coerce.number().int().min(0).max(1000).default(0),
+      })
+      .parse({
+        platform: req.query.platform || undefined,
+        limit: req.query.limit || undefined,
+        offset: req.query.offset || undefined,
+      });
+    let results;
+    if (platform === 'modrinth') {
+      results = (await modrinthApi.search({ query: '', kind: 'modpack', limit, offset, index: 'downloads' })).map(
+        (h) => ({
+          platform,
+          ref: h.slug,
+          name: h.title,
+          iconUrl: h.iconUrl,
+          downloads: h.downloads,
+          description: h.description,
+        })
+      );
+    } else {
+      results = (await curseforgeApi.search({ query: '', kind: 'modpack', limit, index: offset })).map((m) => ({
         platform,
         ref: m.slug,
         name: m.name,
@@ -1596,7 +1640,7 @@ router.post(
 // ---- Blueprints ----
 router.use('/blueprints', require('./blueprints'));
 
-// ---- World quick controls (Overview tab) - version-tolerant service ----
+// ---- World quick controls (World tab) - version-tolerant service ----
 const worldControls = require('../../services/worldControls');
 
 const WORLD_STATE_LIVE_STATUSES = new Set(['running', 'unhealthy', 'stalled']);
@@ -1666,8 +1710,18 @@ router.post(
   requireCap('console'),
   asyncHandler(async (req, res, next) => {
     requireServer(req.params.id);
-    const { action } = z.object({ action: z.enum(Object.keys(worldControls.QUICK_ACTIONS)) }).parse(req.body);
-    const result = await worldControls.runQuick(req.params.id, action, { actor: req.user.username });
+    // Fixed actions plus parameterized ones (number inputs, border fields);
+    // the service validates every parameter value before touching RCON.
+    const { action, params } = z
+      .object({
+        action: z.enum([...Object.keys(worldControls.QUICK_ACTIONS), ...worldControls.PARAM_ACTIONS]),
+        params: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).optional(),
+      })
+      .parse(req.body);
+    const result = await worldControls.runQuick(req.params.id, action, {
+      actor: req.user.username,
+      params: params || {},
+    });
     res.json({ ok: true, ...result });
   })
 );
@@ -2082,11 +2136,37 @@ router.get(
     const state = compat.getReport(req.params.id);
     const entry = state.report && state.report.versions.find((v) => v.version === version);
     if (!entry) throw httpError(404, 'That Minecraft version was not part of the last version check.');
+    // Card rows want icons + the installed build: both live locally
+    // (server_content + the cached library icons), matched by jar filename
+    // with a name fallback. No registry calls - this stays instant offline.
+    const contentRows = db.all(
+      `SELECT sc.filename, sc.name, sc.version, sc.icon_url AS row_icon,
+              lf.icon_rel_path AS lib_rel, lf.icon_url AS lib_icon
+         FROM server_content sc LEFT JOIN library_files lf ON lf.id = sc.library_id
+        WHERE sc.server_id = ?`,
+      req.params.id
+    );
+    const byFile = new Map(contentRows.map((r) => [String(r.filename).toLowerCase(), r]));
+    const byName = new Map(contentRows.map((r) => [String(r.name).toLowerCase(), r]));
+    const enrich = (items) =>
+      Array.isArray(items)
+        ? items.map((m) => {
+            const hit =
+              byFile.get(String((m && m.file) || '').toLowerCase()) ||
+              byName.get(String((m && m.name) || '').toLowerCase());
+            if (!hit) return m;
+            return {
+              ...m,
+              installedVersion: hit.version || null,
+              iconUrl: (hit.lib_rel ? `/${hit.lib_rel}` : hit.lib_icon || hit.row_icon) || null,
+            };
+          })
+        : items;
     res.json({
       ok: true,
-      version: entry,
-      unknown: state.report.unknown,
-      unchecked: state.report.unchecked || [],
+      version: { ...entry, ready: enrich(entry.ready), missing: enrich(entry.missing) },
+      unknown: enrich(state.report.unknown),
+      unchecked: enrich(state.report.unchecked || []),
       partial: state.report.partial,
     });
   })
@@ -2729,6 +2809,33 @@ router.get(
         mc: req.query.mc || undefined,
       });
     res.json({ ok: true, results: await modBrowser.search({ query: q, platform, kind, loader, mc }) });
+  })
+);
+
+// Discover feed for empty states: trending projects on the platform, narrowed
+// to the server's loader + MC so every recommendation is installable. Cached
+// upstream like search (same api_cache rows live 5 minutes).
+router.get(
+  '/mods/discover',
+  asyncHandler(async (req, res, next) => {
+    const { platform, kind, loader, mc, limit, offset } = z
+      .object({
+        platform: z.enum(['modrinth', 'curseforge']).default('modrinth'),
+        kind: z.enum(CONTENT_KINDS).default('mod'),
+        loader: z.enum(BROWSER_LOADERS).optional(),
+        mc: z.string().trim().max(32).optional(),
+        limit: z.coerce.number().int().min(1).max(12).default(8),
+        offset: z.coerce.number().int().min(0).max(1000).default(0),
+      })
+      .parse({
+        platform: req.query.platform || undefined,
+        kind: req.query.kind || undefined,
+        loader: req.query.loader || undefined,
+        mc: req.query.mc || undefined,
+        limit: req.query.limit || undefined,
+        offset: req.query.offset || undefined,
+      });
+    res.json({ ok: true, results: await modBrowser.discover({ platform, kind, loader, mc, limit, offset }) });
   })
 );
 

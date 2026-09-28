@@ -228,23 +228,12 @@ function buildDashboardOverview(servers) {
       ...(since ? [...types, since] : types)
     )?.n || 0;
 
-  const byStatus = {
-    running: 0,
-    starting: 0,
-    stopped: 0,
-    unhealthy: 0,
-    stalled: 0,
-    updating: 0,
-    crashed: 0,
-    'over-quota': 0,
-  };
   let memAllottedMb = 0;
   let memUsedMb = 0;
   let diskUsedBytes = 0;
   let playersOnline = 0;
   let playersMax = 0;
   for (const s of servers) {
-    byStatus[s.status] = (byStatus[s.status] || 0) + 1;
     memAllottedMb += s.resources.containerMemoryMb || 0;
     memUsedMb += s.stats.memUsedMb || 0;
     diskUsedBytes += s.disk.used || 0;
@@ -267,7 +256,6 @@ function buildDashboardOverview(servers) {
   }
 
   return {
-    byStatus,
     mem: { allottedMb: Math.round(memAllottedMb), usedMb: Math.round(memUsedMb) },
     disk: { usedBytes: diskUsedBytes },
     players: { online: playersOnline, max: playersMax },
@@ -308,6 +296,7 @@ async function renderServerList(req, res, next, { page }) {
           autoRestart: Boolean(rows[i].auto_restart),
           notes: rows[i].notes || '',
           updatePolicy: rows[i].update_policy,
+          modUpdatePolicy: rows[i].mod_update_policy || 'manual',
           pendingRecreate: false,
           lastStarted: rows[i].last_started_at || '-',
           created: rows[i].created_at,
@@ -845,27 +834,38 @@ router.get('/worlds', (req, res) => {
 });
 
 router.get('/blueprints', (req, res) => {
+  // Whether the recommendations below can offer CurseForge packs (needs the key).
+  let curseforgeEnabled = false;
+  try {
+    curseforgeEnabled = Boolean(require('../../services/apiKeys').getKey('curseforge'));
+  } catch {
+    // No key store yet - stays disabled.
+  }
   res.render('blueprints', {
     title: 'Blueprints',
     active: 'blueprints',
     blueprints: require('../../blueprints').listBlueprintsFor(req.user),
+    curseforgeEnabled,
   });
 });
 
 router.get('/updates', (req, res) => {
   const checker = require('../../updates/checker');
+  // Split to match the two update policies (and the sidebar counts):
+  // pack + overlay content follow the mods policy, image/MC/loader the game one.
+  const isModUpdate = (u) => u.subjectType === 'pack' || u.subjectType === 'content';
+  const clean = (u) => ({
+    ...u,
+    // Changelog URLs come from remote platform APIs - allow only http(s) so a
+    // hostile response can never plant a javascript: link.
+    changelog: /^https?:\/\//i.test(u.changelog || '') ? u.changelog : null,
+  });
+  const visible = checker.listOutdated().filter((u) => !u.serverId || res.locals.visibleServerIds.has(u.serverId));
   res.render('updates', {
     title: 'Updates',
     active: 'updates',
-    // Changelog URLs come from remote platform APIs - allow only http(s) so a
-    // hostile response can never plant a javascript: link.
-    updates: checker
-      .listOutdated()
-      .filter((u) => !u.serverId || res.locals.visibleServerIds.has(u.serverId))
-      .map((u) => ({
-        ...u,
-        changelog: /^https?:\/\//i.test(u.changelog || '') ? u.changelog : null,
-      })),
+    serverUpdates: visible.filter((u) => !isModUpdate(u)).map(clean),
+    modUpdates: visible.filter(isModUpdate).map(clean),
     lastChecked: checker.lastCheckedAt() || null,
   });
 });

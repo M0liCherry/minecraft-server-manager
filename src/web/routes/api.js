@@ -1527,14 +1527,29 @@ router.post(
 router.post(
   '/servers/:id/backups/:backupId/restore',
   requireCap('backups'),
-  asyncHandler((req, res, next) => {
+  asyncHandler(async (req, res, next) => {
     const server = requireServer(req.params.id);
     const actor = req.user.username;
     const backupId = req.params.backupId;
+    const { destinationId } = z.object({ destinationId: z.string().trim().max(40).optional() }).parse(req.body || {});
     const taskId = tasks.run(
       `Restoring backup on ${server.display_name}`,
       { serverId: server.id, actor },
       async (t) => {
+        // Local archives can be gone (deleted for space) while an offsite
+        // copy survives: pull it back into place first, then restore
+        // normally. Orphaned tmp downloads are wiped on boot.
+        const row = db.get('SELECT * FROM backups WHERE id = ?', backupId);
+        if (!row) throw Object.assign(new Error('Backup not found'), { status: 404 });
+        if (!fs.existsSync(dataPath(row.rel_path))) {
+          t.step('Local archive missing - downloading from offsite storage…');
+          const { tmpPath } = await require('../../services/remotes').downloadForRestore(backupId, destinationId, {
+            actor,
+            task: t,
+          });
+          await fsp.mkdir(path.dirname(dataPath(row.rel_path)), { recursive: true });
+          await fsp.rename(tmpPath, dataPath(row.rel_path));
+        }
         t.step('Stopping server & taking a safety backup…');
         await backups.restoreBackup(server.id, backupId, { actor });
         return { ok: true };
@@ -1563,7 +1578,11 @@ router.delete(
   '/backups/:backupId',
   requireCap('backups', { resolve: backupServerId }),
   asyncHandler(async (req, res, next) => {
-    res.json({ ok: true, ...(await backups.deleteBackup(req.params.backupId, { actor: req.user.username })) });
+    // An explicit delete removes offsite copies too; retention pruning leaves them alone.
+    res.json({
+      ok: true,
+      ...(await backups.deleteBackup(req.params.backupId, { actor: req.user.username, remote: 'delete' })),
+    });
   })
 );
 
@@ -1607,9 +1626,134 @@ router.get('/backups/retention', requireRoleKeys('admin'), (req, res) => {
 router.post(
   '/backups/retention',
   requireRoleKeys('admin'),
-  asyncHandler((req, res, next) => {
+  asyncHandler(async (req, res, next) => {
     const patch = retentionPatchSchema.parse(req.body || {});
     res.json({ ok: true, global: backupRetention.setGlobal(patch) });
+  })
+);
+
+// ---- Offsite backup destinations (Nextcloud / Dropbox / Google Drive) ----
+// Local backups stay the default: these endpoints only configure explicit
+// offsite copies. Management is admin-only; per-archive upload/download rides
+// the backups capability of the archive's server.
+const remotes = require('../../services/remotes');
+
+const remoteBodySchema = z.object({
+  name: z.string().trim().min(1).max(80).optional(),
+  provider: z.enum(['nextcloud', 'dropbox', 'gdrive']).optional(),
+  config: z.record(z.string(), z.string()).optional(),
+  secret: z.record(z.string(), z.string()).optional(),
+  autoUpload: z.coerce.boolean().optional(),
+});
+
+// Upload targets for operators: names only, no secrets or config. The global
+// requireWrite gate already keeps viewers out; the upload itself re-checks
+// the archive's backups capability.
+router.get('/remotes/targets', (req, res) => {
+  res.json({
+    ok: true,
+    destinations: remotes.listDestinations().map((d) => ({ id: d.id, name: d.name, provider: d.providerLabel })),
+  });
+});
+
+router.get('/remotes', requireRoleKeys('admin'), (req, res) => {
+  const destinations = remotes.listDestinations().map((d) => {
+    const counts = db.get(
+      `SELECT SUM(status = 'done') AS done, SUM(status IN ('pending','uploading')) AS pending,
+              SUM(status = 'failed') AS failed
+         FROM remote_backup_files WHERE destination_id = ?`,
+      d.id
+    );
+    return {
+      ...d,
+      counts: { done: counts?.done || 0, pending: counts?.pending || 0, failed: counts?.failed || 0 },
+    };
+  });
+  res.json({ ok: true, destinations });
+});
+
+router.post(
+  '/remotes',
+  requireRoleKeys('admin'),
+  asyncHandler(async (req, res, next) => {
+    const input = z
+      .object({
+        name: z.string().trim().min(1).max(80),
+        provider: z.enum(['nextcloud', 'dropbox', 'gdrive']),
+        config: z.record(z.string(), z.string()).default({}),
+        secret: z.record(z.string(), z.string()).optional(),
+        autoUpload: z.coerce.boolean().optional(),
+      })
+      .parse(req.body);
+    const created = remotes.createDestination(input, { actor: req.user.username });
+    if (input.autoUpload) remotes.updateDestination(created.id, { autoUpload: true }, { actor: req.user.username });
+    res.status(201).json({ ok: true, destination: remotes.getDestination(created.id) });
+  })
+);
+
+router.patch(
+  '/remotes/:id',
+  requireRoleKeys('admin'),
+  asyncHandler(async (req, res, next) => {
+    res.json({
+      ok: true,
+      destination: remotes.updateDestination(req.params.id, remoteBodySchema.parse(req.body), {
+        actor: req.user.username,
+      }),
+    });
+  })
+);
+
+router.delete(
+  '/remotes/:id',
+  requireRoleKeys('admin'),
+  asyncHandler(async (req, res, next) => {
+    res.json({ ok: true, ...remotes.deleteDestination(req.params.id, { actor: req.user.username }) });
+  })
+);
+
+router.post(
+  '/remotes/:id/test',
+  requireRoleKeys('admin'),
+  asyncHandler(async (req, res, next) => {
+    res.json({ ok: true, ...(await remotes.testConnection(req.params.id)) });
+  })
+);
+
+// Explicit per-archive upload (works whether or not auto-upload is on).
+// The archive belongs to a server, so this follows its backups capability.
+router.post(
+  '/remotes/:id/upload/:backupId',
+  requireCap('backups', { resolve: backupServerId }),
+  asyncHandler(async (req, res, next) => {
+    const row = db.get('SELECT id FROM backups WHERE id = ?', req.params.backupId);
+    if (!row) throw Object.assign(new Error('Backup not found'), { status: 404 });
+    // backupServerId resolves req.params.backupId for the capability above.
+    const taskId = remotes.startUploadTask(req.params.backupId, req.params.id, { actor: req.user.username });
+    res.status(202).json({ ok: true, taskId });
+  })
+);
+
+// OAuth start for Dropbox / Google Drive: returns the provider URL, the
+// browser navigates there, and the provider calls back below.
+router.post(
+  '/remotes/:id/oauth/start',
+  requireRoleKeys('admin'),
+  asyncHandler(async (req, res, next) => {
+    const dest = remotes.getDestination(req.params.id);
+    if (!dest) throw Object.assign(new Error('Destination not found'), { status: 404 });
+    const { state } = remotes.beginOAuth(req.params.id);
+    const redirectUri = `${req.protocol}://${req.get('host')}/remotes/oauth/callback`;
+    res.json({
+      ok: true,
+      url: remotes.oauthAuthorizeUrl(
+        dest.provider,
+        { ...dest, config_json: JSON.stringify(dest.config) },
+        redirectUri,
+        state
+      ),
+      redirectUri,
+    });
   })
 );
 

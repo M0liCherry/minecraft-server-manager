@@ -162,15 +162,17 @@ const CAPABILITY_INFO = {
     help: 'Create, restore, download, and delete backups.',
     covers: [
       'Back up now, restore a backup, download, rename, and delete archives of this server.',
+      'Upload an archive copy to a connected offsite destination.',
       'Schedule backups for this server.',
     ],
-    excludes: 'Retention rules, which stay admin-only.',
+    excludes: 'Retention rules and destination setup, which stay admin-only.',
     reach: [
       'POST /api/servers/:id/backups',
       'POST /api/servers/:id/backups/:backupId/restore',
       'GET /api/backups/:backupId/download',
       'PATCH /api/backups/:backupId',
       'DELETE /api/backups/:backupId',
+      'POST /api/remotes/:id/upload/:backupId',
       'POST /api/schedules (backup)',
     ],
   },

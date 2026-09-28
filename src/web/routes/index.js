@@ -798,6 +798,24 @@ router.get(
   })
 );
 
+// OAuth callback for offsite backup destinations (Dropbox / Google Drive).
+// Admin-only: completing someone else's flow would attach their storage to
+// this panel. The state token ties the callback to a started flow.
+router.get('/remotes/oauth/callback', requireRole('admin'), async (req, res, next) => {
+  try {
+    const { code, state } = req.query;
+    if (!code || !state) throw Object.assign(new Error('Authorization did not complete.'), { status: 400 });
+    const remotes = require('../../services/remotes');
+    const row = require('../../db').get('SELECT id FROM remote_destinations WHERE oauth_state = ?', state);
+    if (!row) throw Object.assign(new Error('Authorization expired or already used.'), { status: 400 });
+    const redirectUri = `${req.protocol}://${req.get('host')}/remotes/oauth/callback`;
+    await remotes.finishOAuth(row.id, state, String(code), redirectUri);
+    res.redirect(302, '/backups');
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.get('/wizard-transcripts', requireRole('admin'), (req, res) => {
   const wizard = require('../../services/wizard');
   res.render('wizard-transcripts', {
@@ -881,26 +899,42 @@ router.get('/backups', (req, res) => {
     `SELECT COUNT(*) AS n, COALESCE(SUM(size_bytes), 0) AS s FROM backups WHERE server_id IN (${ph})`,
     ...visible
   );
-  const backups = db
-    .all(
-      `SELECT b.*, s.display_name FROM backups b JOIN servers s ON s.id = b.server_id
-        WHERE b.server_id IN (${ph}) ORDER BY b.created_at DESC LIMIT 200`,
-      ...visible
-    )
-    .map((b) => ({
-      id: b.id,
-      serverId: b.server_id,
-      server: b.display_name,
-      file: b.filename,
-      size: b.size_bytes,
-      reason: b.reason,
-      ts: b.created_at,
-    }));
+  const backupRows = db.all(
+    `SELECT b.*, s.display_name FROM backups b JOIN servers s ON s.id = b.server_id
+      WHERE b.server_id IN (${ph}) ORDER BY b.created_at DESC LIMIT 200`,
+    ...visible
+  );
+  const { dataPath } = require('../../storage/pathGuard');
+  const fs = require('node:fs');
+  const remoteMap = require('../../services/remotes').filesForBackups(backupRows.map((b) => b.id));
+  const backups = backupRows.map((b) => ({
+    id: b.id,
+    serverId: b.server_id,
+    server: b.display_name,
+    file: b.filename,
+    size: b.size_bytes,
+    reason: b.reason,
+    ts: b.created_at,
+    local: fs.existsSync(dataPath(b.rel_path)),
+    remotes: remoteMap.get(b.id) || [],
+  }));
+  const remotes = require('../../services/remotes');
+  const destinations = remotes.listDestinations().map((d) => {
+    const counts = db.get(
+      `SELECT SUM(status = 'done') AS done, SUM(status IN ('pending','uploading')) AS pending,
+              SUM(status = 'failed') AS failed
+         FROM remote_backup_files WHERE destination_id = ?`,
+      d.id
+    );
+    return { ...d, counts: { done: counts?.done || 0, pending: counts?.pending || 0, failed: counts?.failed || 0 } };
+  });
   res.render('backups', {
     title: 'Backups',
     active: 'backups',
     backups,
     totals: { count: totals.n, bytes: totals.s },
+    destinations,
+    isAdmin: req.user.role === 'admin',
   });
 });
 
